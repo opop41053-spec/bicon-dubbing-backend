@@ -1,17 +1,13 @@
 import os
-import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
-
 
 app = FastAPI(
     title="BICON DUBBING STUDIO API",
-    version="1.0.0"
+    version="2.0.0"
 )
-
 
 # ---------------------------------------------------------
 # CORS
@@ -20,22 +16,13 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://opop41053-spec.github.io"
+        "https://opop41053-spec.github.io",
+        "https://opop41053-spec.github.io/",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# ---------------------------------------------------------
-# OpenAI client
-# ---------------------------------------------------------
-
-api_key = os.getenv("OPENAI_API_KEY")
-
-client = OpenAI(api_key=api_key) if api_key else None
-
 
 # ---------------------------------------------------------
 # Configuration
@@ -49,15 +36,13 @@ ALLOWED_EXTENSIONS = {
     ".m4a",
     ".ogg",
     ".webm",
-    ".mp4",
+    ".flac",
     ".mpeg",
     ".mpga",
-    ".flac",
 }
 
-
 # ---------------------------------------------------------
-# Health Check
+# Root
 # ---------------------------------------------------------
 
 @app.get("/")
@@ -65,35 +50,31 @@ async def root():
     return {
         "name": "BICON DUBBING STUDIO API",
         "status": "online",
-        "version": "1.0.0"
+        "version": "2.0.0"
     }
 
+# ---------------------------------------------------------
+# Health
+# ---------------------------------------------------------
 
 @app.get("/health")
 async def health():
     return {
         "status": "healthy",
-        "openai_configured": client is not None
+        "backend": "BICON DUBBING STUDIO",
+        "api_keys_required": False
     }
 
-
 # ---------------------------------------------------------
-# Speech-to-Text
+# Audio Upload
 # ---------------------------------------------------------
 
-@app.post("/api/transcribe")
-async def transcribe_audio(
-    file: UploadFile = File(...)
-):
-    if not client:
-        raise HTTPException(
-            status_code=503,
-            detail="OPENAI_API_KEY is not configured on the server."
-        )
+@app.post("/api/upload")
+async def upload_audio(file: UploadFile = File(...)):
 
-    original_name = file.filename or "audio.webm"
+    filename = file.filename or "audio"
 
-    extension = Path(original_name).suffix.lower()
+    extension = Path(filename).suffix.lower()
 
     if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -112,44 +93,126 @@ async def transcribe_audio(
     if len(audio_data) > MAX_AUDIO_SIZE:
         raise HTTPException(
             status_code=413,
-            detail="Audio file is too large. Maximum size is 25 MB."
+            detail="Audio file is larger than 25 MB."
         )
 
-    temp_path = None
+    return {
+        "success": True,
+        "filename": filename,
+        "size": len(audio_data),
+        "content_type": file.content_type,
+        "message": "Audio received successfully."
+    }
 
-    try:
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=extension
-        ) as temp_file:
+# ---------------------------------------------------------
+# Transcription
+# ---------------------------------------------------------
 
-            temp_file.write(audio_data)
-            temp_path = temp_file.name
+@app.post("/api/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...)
+):
 
-        with open(temp_path, "rb") as audio_file:
+    filename = file.filename or "audio"
 
-            result = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=audio_file
-            )
+    extension = Path(filename).suffix.lower()
 
-        return {
-            "success": True,
-            "text": result.text
-        }
-
-    except Exception as exc:
-
+    if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
-            status_code=500,
-            detail=f"Transcription failed: {str(exc)}"
+            status_code=400,
+            detail="Unsupported audio format."
         )
 
-    finally:
+    audio_data = await file.read()
 
-        if temp_path:
+    if not audio_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Audio file is empty."
+        )
 
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+    if len(audio_data) > MAX_AUDIO_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="Audio file is larger than 25 MB."
+        )
+
+    return {
+        "success": False,
+        "status": "engine_not_connected",
+        "text": "",
+        "message": (
+            "The audio upload was received, "
+            "but a speech-to-text engine has not been connected yet."
+        )
+    }
+
+# ---------------------------------------------------------
+# Translation
+# ---------------------------------------------------------
+
+@app.post("/api/translate")
+async def translate(data: dict):
+
+    text = str(data.get("text", "")).strip()
+    source_language = str(
+        data.get("source_language", "")
+    ).strip()
+    target_language = str(
+        data.get("target_language", "")
+    ).strip()
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Text is required."
+        )
+
+    if not target_language:
+        raise HTTPException(
+            status_code=400,
+            detail="Target language is required."
+        )
+
+    return {
+        "success": False,
+        "status": "engine_not_connected",
+        "translated_text": "",
+        "source_language": source_language,
+        "target_language": target_language,
+        "message": (
+            "Translation engine has not been connected yet."
+        )
+    }
+
+# ---------------------------------------------------------
+# Dubbing
+# ---------------------------------------------------------
+
+@app.post("/api/dubbing")
+async def dubbing(data: dict):
+
+    text = str(data.get("text", "")).strip()
+    source_language = str(
+        data.get("source_language", "")
+    ).strip()
+    target_language = str(
+        data.get("target_language", "")
+    ).strip()
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Text is required."
+        )
+
+    return {
+        "success": False,
+        "status": "voice_engine_not_connected",
+        "source_language": source_language,
+        "target_language": target_language,
+        "message": (
+            "Authorized voice-generation engine "
+            "has not been connected yet."
+        )
+    }
