@@ -1,5 +1,4 @@
 import os
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -12,15 +11,16 @@ from openai import OpenAI
 
 
 # ============================================================
-# BICON DUBBING STUDIO - FASTAPI BACKEND
+# BICON DUBBING STUDIO
+# FastAPI Backend
 # ============================================================
 
 APP_NAME = "BICON DUBBING STUDIO API"
 APP_VERSION = "2.0.0"
 
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 MAX_AUDIO_SIZE = 25 * 1024 * 1024  # 25 MB
 
@@ -36,22 +36,36 @@ ALLOWED_EXTENSIONS = {
     ".flac",
 }
 
-# GitHub Pages + common local development origins
+# ============================================================
+# CORS
+# ============================================================
+
+# GitHub Pages
+# Local frontend
+# Common Codespaces forwarded HTTPS URLs
 ALLOWED_ORIGINS = [
     "https://opop41053-spec.github.io",
 
-    # Local development
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+
     "http://localhost:5500",
     "http://127.0.0.1:5500",
+
     "http://localhost:8000",
     "http://127.0.0.1:8000",
 ]
 
-# ------------------------------------------------------------
-# OpenAI configuration
-# ------------------------------------------------------------
+# Codespaces URLs normally look like:
+# https://something-8000.app.github.dev
+CODESPACES_ORIGIN_REGEX = (
+    r"^https://[a-zA-Z0-9-]+-\d+\.app\.github\.dev$"
+)
+
+
+# ============================================================
+# OPENAI
+# ============================================================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -61,28 +75,30 @@ if OPENAI_API_KEY:
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
+        # Never crash the backend just because the client
+        # could not be initialized.
         client = None
 
 
 # ============================================================
-# FastAPI application
+# FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
-    description="Backend API for BICON Dubbing Studio",
+    description="BICON Dubbing Studio Backend API",
 )
 
 
 # ============================================================
-# CORS
+# CORS MIDDLEWARE
 # ============================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origin_regex=CODESPACES_ORIGIN_REGEX,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -90,13 +106,10 @@ app.add_middleware(
 
 
 # ============================================================
-# Helper functions
+# HELPERS
 # ============================================================
 
 def get_extension(filename: Optional[str]) -> str:
-    """
-    Safely return a lowercase file extension.
-    """
     if not filename:
         return ""
 
@@ -104,9 +117,6 @@ def get_extension(filename: Optional[str]) -> str:
 
 
 def validate_extension(filename: Optional[str]) -> str:
-    """
-    Validate the uploaded file extension.
-    """
     extension = get_extension(filename)
 
     if extension not in ALLOWED_EXTENSIONS:
@@ -116,8 +126,9 @@ def validate_extension(filename: Optional[str]) -> str:
                 "success": False,
                 "error": "UNSUPPORTED_FILE_TYPE",
                 "message": (
-                    f"Unsupported file type: {extension or 'unknown'}. "
-                    f"Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                    "Unsupported file type. "
+                    f"Allowed types: "
+                    f"{', '.join(sorted(ALLOWED_EXTENSIONS))}"
                 ),
             },
         )
@@ -130,10 +141,10 @@ async def save_upload_with_limit(
     destination: str,
 ) -> int:
     """
-    Save an UploadFile in chunks while enforcing the 25 MB limit.
+    Saves an uploaded file in chunks.
 
-    Returns:
-        int: number of bytes written.
+    The 25 MB limit is enforced while reading,
+    so oversized files are rejected safely.
     """
 
     total_size = 0
@@ -156,7 +167,9 @@ async def save_upload_with_limit(
                         detail={
                             "success": False,
                             "error": "FILE_TOO_LARGE",
-                            "message": "Maximum allowed file size is 25 MB.",
+                            "message": (
+                                "Maximum allowed file size is 25 MB."
+                            ),
                             "max_size_mb": 25,
                         },
                     )
@@ -164,17 +177,11 @@ async def save_upload_with_limit(
                 output_file.write(chunk)
 
     except HTTPException:
-        try:
-            os.remove(destination)
-        except OSError:
-            pass
+        safe_remove(destination)
         raise
 
     except Exception as exc:
-        try:
-            os.remove(destination)
-        except OSError:
-            pass
+        safe_remove(destination)
 
         raise HTTPException(
             status_code=500,
@@ -192,9 +199,6 @@ async def save_upload_with_limit(
 
 
 def safe_remove(path: Optional[str]) -> None:
-    """
-    Safely delete a temporary file.
-    """
     if not path:
         return
 
@@ -206,9 +210,6 @@ def safe_remove(path: Optional[str]) -> None:
 
 
 def normalize_language(language: Optional[str]) -> str:
-    """
-    Normalize language input.
-    """
     if not language:
         return "en"
 
@@ -216,7 +217,7 @@ def normalize_language(language: Optional[str]) -> str:
 
 
 # ============================================================
-# Request models
+# REQUEST MODELS
 # ============================================================
 
 class TranslateRequest(BaseModel):
@@ -232,11 +233,13 @@ class TranslateRequest(BaseModel):
 @app.get("/")
 async def root():
     return {
+        "success": True,
         "name": APP_NAME,
         "status": "online",
         "version": APP_VERSION,
         "openai_configured": client is not None,
-        "endpoints": {
+        "max_upload_size_mb": 25,
+        "routes": {
             "health": "GET /health",
             "upload": "POST /api/upload",
             "transcribe": "POST /api/transcribe",
@@ -253,6 +256,7 @@ async def root():
 @app.get("/health")
 async def health():
     return {
+        "success": True,
         "status": "healthy",
         "service": APP_NAME,
         "version": APP_VERSION,
@@ -262,7 +266,32 @@ async def health():
 
 
 # ============================================================
-# UPLOAD
+# API INFORMATION
+# ============================================================
+
+@app.get("/api")
+async def api_info():
+    return {
+        "success": True,
+        "name": APP_NAME,
+        "version": APP_VERSION,
+        "status": "online",
+        "openai_configured": client is not None,
+        "max_upload_size_mb": 25,
+        "endpoints": [
+            "GET /",
+            "GET /health",
+            "GET /api",
+            "POST /api/upload",
+            "POST /api/transcribe",
+            "POST /api/translate",
+            "POST /api/dubbing",
+        ],
+    }
+
+
+# ============================================================
+# POST /api/upload
 # ============================================================
 
 @app.post("/api/upload")
@@ -270,10 +299,10 @@ async def upload_audio(
     file: UploadFile = File(...),
 ):
     """
-    Upload an audio/video file.
+    Upload and validate an audio/video file.
 
-    The file is temporarily stored only for validation.
-    It is deleted after the response is prepared.
+    The file is stored temporarily only for validation
+    and then deleted.
     """
 
     if not file.filename:
@@ -304,11 +333,15 @@ async def upload_audio(
 
         return {
             "success": True,
-            "message": "File uploaded successfully.",
+            "mode": "demo" if client is None else "ready",
+            "message": "File uploaded and validated successfully.",
             "filename": file.filename,
             "extension": extension,
             "size_bytes": file_size,
-            "size_mb": round(file_size / (1024 * 1024), 2),
+            "size_mb": round(
+                file_size / (1024 * 1024),
+                2,
+            ),
             "max_size_mb": 25,
             "openai_configured": client is not None,
         }
@@ -318,7 +351,7 @@ async def upload_audio(
 
 
 # ============================================================
-# TRANSCRIBE
+# POST /api/transcribe
 # ============================================================
 
 @app.post("/api/transcribe")
@@ -326,13 +359,13 @@ async def transcribe_audio(
     file: UploadFile = File(...),
 ):
     """
-    Convert uploaded audio to text.
+    Speech-to-text.
 
-    If OPENAI_API_KEY is configured:
-        Uses OpenAI transcription.
+    Without OPENAI_API_KEY:
+        Returns structured demo response.
 
-    If OPENAI_API_KEY is missing:
-        Returns a structured demo response instead of crashing.
+    With OPENAI_API_KEY:
+        Attempts real transcription.
     """
 
     if not file.filename:
@@ -362,21 +395,22 @@ async def transcribe_audio(
         )
 
         # ----------------------------------------------------
-        # DEMO MODE: OpenAI key not configured
+        # DEMO MODE
         # ----------------------------------------------------
 
         if client is None:
             return {
                 "success": True,
                 "mode": "demo",
+                "endpoint": "/api/transcribe",
                 "message": (
                     "Transcription endpoint is working, "
                     "but OPENAI_API_KEY is not configured."
                 ),
                 "text": (
                     "[DEMO TRANSCRIPT] "
-                    "OpenAI transcription is disabled because no API key "
-                    "is configured on the backend."
+                    "No OpenAI API key is configured, "
+                    "so real transcription is disabled."
                 ),
                 "filename": file.filename,
                 "size_bytes": file_size,
@@ -388,18 +422,26 @@ async def transcribe_audio(
         # ----------------------------------------------------
 
         try:
-            with open(temporary_path, "rb") as audio_file:
+            with open(
+                temporary_path,
+                "rb",
+            ) as audio_file:
 
                 result = client.audio.transcriptions.create(
                     model="gpt-4o-mini-transcribe",
                     file=audio_file,
                 )
 
-            text = getattr(result, "text", "") or ""
+            text = getattr(
+                result,
+                "text",
+                "",
+            ) or ""
 
             return {
                 "success": True,
                 "mode": "openai",
+                "endpoint": "/api/transcribe",
                 "text": text,
                 "filename": file.filename,
                 "size_bytes": file_size,
@@ -407,11 +449,10 @@ async def transcribe_audio(
             }
 
         except Exception as exc:
-
-            # Do not let OpenAI/API errors crash the application.
             return {
                 "success": False,
                 "mode": "openai",
+                "endpoint": "/api/transcribe",
                 "error": "TRANSCRIPTION_FAILED",
                 "message": str(exc),
                 "text": "",
@@ -423,19 +464,21 @@ async def transcribe_audio(
 
 
 # ============================================================
-# TRANSLATE
+# POST /api/translate
 # ============================================================
 
 @app.post("/api/translate")
-async def translate_text(request: TranslateRequest):
+async def translate_text(
+    request: TranslateRequest,
+):
     """
-    Translate transcript text.
+    Text translation.
 
-    If OpenAI is configured:
-        Attempts translation using the OpenAI Responses API.
+    Without OPENAI_API_KEY:
+        Returns structured demo translation.
 
-    If OpenAI is not configured:
-        Returns a structured demo translation.
+    With OPENAI_API_KEY:
+        Attempts real translation.
     """
 
     text = request.text.strip()
@@ -459,7 +502,7 @@ async def translate_text(request: TranslateRequest):
         )
 
     # --------------------------------------------------------
-    # Same-language shortcut
+    # SAME LANGUAGE
     # --------------------------------------------------------
 
     if (
@@ -469,6 +512,7 @@ async def translate_text(request: TranslateRequest):
         return {
             "success": True,
             "mode": "passthrough",
+            "endpoint": "/api/translate",
             "source_language": source_language,
             "target_language": target_language,
             "original_text": text,
@@ -484,15 +528,17 @@ async def translate_text(request: TranslateRequest):
         return {
             "success": True,
             "mode": "demo",
+            "endpoint": "/api/translate",
+            "message": (
+                "Translation endpoint is working, "
+                "but OPENAI_API_KEY is not configured."
+            ),
             "source_language": source_language,
             "target_language": target_language,
             "original_text": text,
             "translated_text": (
-                f"[DEMO TRANSLATION → {target_language}] {text}"
-            ),
-            "message": (
-                "Translation endpoint is working, but "
-                "OPENAI_API_KEY is not configured."
+                f"[DEMO TRANSLATION -> "
+                f"{target_language}] {text}"
             ),
             "openai_configured": False,
         }
@@ -503,10 +549,10 @@ async def translate_text(request: TranslateRequest):
 
     try:
         prompt = (
-            "Translate the following text accurately.\n"
+            "Translate the following text accurately.\n\n"
             f"Source language: {source_language}\n"
             f"Target language: {target_language}\n\n"
-            "Return only the translated text. "
+            "Return ONLY the translated text. "
             "Do not add explanations.\n\n"
             f"Text:\n{text}"
         )
@@ -516,20 +562,25 @@ async def translate_text(request: TranslateRequest):
             input=prompt,
         )
 
-        translated_text = getattr(
-            response,
-            "output_text",
-            "",
-        ) or ""
-
-        translated_text = translated_text.strip()
+        translated_text = (
+            getattr(
+                response,
+                "output_text",
+                "",
+            )
+            or ""
+        ).strip()
 
         if not translated_text:
             return {
                 "success": False,
                 "mode": "openai",
+                "endpoint": "/api/translate",
                 "error": "EMPTY_TRANSLATION",
-                "message": "OpenAI returned an empty translation.",
+                "message": (
+                    "The translation service returned "
+                    "an empty result."
+                ),
                 "source_language": source_language,
                 "target_language": target_language,
                 "original_text": text,
@@ -540,6 +591,7 @@ async def translate_text(request: TranslateRequest):
         return {
             "success": True,
             "mode": "openai",
+            "endpoint": "/api/translate",
             "source_language": source_language,
             "target_language": target_language,
             "original_text": text,
@@ -548,10 +600,10 @@ async def translate_text(request: TranslateRequest):
         }
 
     except Exception as exc:
-
         return {
             "success": False,
             "mode": "openai",
+            "endpoint": "/api/translate",
             "error": "TRANSLATION_FAILED",
             "message": str(exc),
             "source_language": source_language,
@@ -563,7 +615,7 @@ async def translate_text(request: TranslateRequest):
 
 
 # ============================================================
-# DUBBING / TEXT-TO-SPEECH
+# POST /api/dubbing
 # ============================================================
 
 @app.post("/api/dubbing")
@@ -574,25 +626,32 @@ async def generate_dubbing(
     voice_reference: Optional[UploadFile] = File(None),
 ):
     """
-    Generate speech from translated text.
+    Text-to-speech / dubbing endpoint.
 
     IMPORTANT:
-    This endpoint does NOT perform voice cloning.
+    This implementation does NOT clone a user's voice.
 
-    With OpenAI configured:
+    voice_reference is accepted and validated as an optional
+    reference file, but it is not used for voice cloning.
+
+    Without OPENAI_API_KEY:
+        Returns structured demo response.
+
+    With OPENAI_API_KEY:
         Generates standard TTS audio.
-
-    Without OpenAI configured:
-        Returns structured demo JSON.
-
-    voice_reference:
-        Accepted as an optional uploaded reference, but it is not
-        used for cloning in this implementation.
     """
 
     text = text.strip()
-    target_language = normalize_language(target_language)
-    voice = voice.strip() or "alloy"
+
+    target_language = normalize_language(
+        target_language
+    )
+
+    voice = (
+        voice.strip()
+        if voice
+        else "alloy"
+    )
 
     if not text:
         raise HTTPException(
@@ -605,11 +664,12 @@ async def generate_dubbing(
         )
 
     # --------------------------------------------------------
-    # Validate voice reference if supplied
+    # OPTIONAL VOICE REFERENCE
     # --------------------------------------------------------
 
     reference_path = None
     reference_size = 0
+    reference_filename = None
 
     if voice_reference is not None:
 
@@ -619,9 +679,16 @@ async def generate_dubbing(
                 detail={
                     "success": False,
                     "error": "INVALID_VOICE_REFERENCE",
-                    "message": "Voice reference filename is missing.",
+                    "message": (
+                        "Voice reference filename "
+                        "is missing."
+                    ),
                 },
             )
+
+        reference_filename = (
+            voice_reference.filename
+        )
 
         reference_extension = validate_extension(
             voice_reference.filename
@@ -634,9 +701,11 @@ async def generate_dubbing(
             ) as temp_file:
                 reference_path = temp_file.name
 
-            reference_size = await save_upload_with_limit(
-                voice_reference,
-                reference_path,
+            reference_size = (
+                await save_upload_with_limit(
+                    voice_reference,
+                    reference_path,
+                )
             )
 
         except Exception:
@@ -654,19 +723,27 @@ async def generate_dubbing(
         return {
             "success": True,
             "mode": "demo",
+            "endpoint": "/api/dubbing",
             "message": (
-                "Dubbing endpoint is working, but "
-                "OPENAI_API_KEY is not configured. "
-                "No audio was generated."
+                "Dubbing endpoint is working, "
+                "but OPENAI_API_KEY is not configured. "
+                "No audio file was generated."
             ),
             "target_language": target_language,
             "voice": voice,
             "text": text,
             "audio_generated": False,
             "audio_url": None,
-            "voice_reference_received": reference_path is not None,
-            "voice_reference_size_bytes": reference_size,
             "voice_cloning": False,
+            "voice_reference_received": (
+                reference_filename is not None
+            ),
+            "voice_reference_filename": (
+                reference_filename
+            ),
+            "voice_reference_size_bytes": (
+                reference_size
+            ),
             "openai_configured": False,
         }
 
@@ -686,26 +763,23 @@ async def generate_dubbing(
 
         try:
 
-            with open(output_path, "wb") as audio_output:
+            response = client.audio.speech.create(
+                model="gpt-4o-mini-tts",
+                voice=voice,
+                input=text,
+                response_format="mp3",
+            )
 
-                response = client.audio.speech.create(
-                    model="gpt-4o-mini-tts",
-                    voice=voice,
-                    input=text,
-                    response_format="mp3",
-                )
+            response.write_to_file(
+                output_path
+            )
 
-                response.write_to_file(output_path)
-
-            # ------------------------------------------------
-            # Return generated MP3
-            # ------------------------------------------------
-
+            # Do NOT delete output_path here.
+            # FileResponse needs the file to still exist.
             return FileResponse(
                 path=output_path,
                 media_type="audio/mpeg",
                 filename="bicon_dubbed_audio.mp3",
-                background=None,
             )
 
         except Exception as exc:
@@ -715,6 +789,7 @@ async def generate_dubbing(
             return {
                 "success": False,
                 "mode": "openai",
+                "endpoint": "/api/dubbing",
                 "error": "DUBBING_FAILED",
                 "message": str(exc),
                 "target_language": target_language,
@@ -731,32 +806,7 @@ async def generate_dubbing(
 
 
 # ============================================================
-# OPTIONS / API information
-# ============================================================
-
-@app.get("/api")
-async def api_info():
-    return {
-        "success": True,
-        "name": APP_NAME,
-        "version": APP_VERSION,
-        "status": "online",
-        "openai_configured": client is not None,
-        "max_upload_size_mb": 25,
-        "routes": {
-            "GET /": "API information",
-            "GET /health": "Health check",
-            "GET /api": "API information",
-            "POST /api/upload": "Upload and validate media",
-            "POST /api/transcribe": "Speech-to-text",
-            "POST /api/translate": "Text translation",
-            "POST /api/dubbing": "Text-to-speech",
-        },
-    }
-
-
-# ============================================================
-# LOCAL DEVELOPMENT ENTRY POINT
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
@@ -765,6 +815,11 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
+        port=int(
+            os.getenv(
+                "PORT",
+                "8000",
+            )
+        ),
         reload=False,
     )
