@@ -394,6 +394,16 @@ async def transcribe_audio(
             temporary_path,
         )
 
+        if file_size <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "success": False,
+                    "error": "EMPTY_AUDIO_FILE",
+                    "message": "The uploaded audio file is empty.",
+                },
+            )
+
         # ----------------------------------------------------
         # DEMO MODE
         # ----------------------------------------------------
@@ -427,16 +437,29 @@ async def transcribe_audio(
                 "rb",
             ) as audio_file:
 
+                # OpenAI's current transcription models return a JSON
+                # transcription object. Explicitly request JSON so the SDK
+                # always gives us a response object containing `.text`.
                 result = client.audio.transcriptions.create(
                     model="gpt-4o-mini-transcribe",
                     file=audio_file,
+                    response_format="json",
                 )
 
-            text = getattr(
-                result,
-                "text",
-                "",
-            ) or ""
+            text = (
+                getattr(result, "text", None)
+                or ""
+            ).strip()
+
+            # Do not report success when OpenAI returned an empty transcript.
+            # This makes the real failure visible to the frontend instead of
+            # looking like a successful upload with missing text.
+            if not text:
+                raise RuntimeError(
+                    "OpenAI accepted the audio file but returned an empty "
+                    "transcription. Check that the uploaded file contains "
+                    "audible speech and is a supported audio format."
+                )
 
             return {
                 "success": True,
