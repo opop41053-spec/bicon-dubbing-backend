@@ -441,7 +441,7 @@ async def transcribe_audio(
                 # transcription object. Explicitly request JSON so the SDK
                 # always gives us a response object containing `.text`.
                 result = client.audio.transcriptions.create(
-                    model="gpt-4o-mini-transcribe",
+                    model="whisper-1",
                     file=audio_file,
                     response_format="json",
                 )
