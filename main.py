@@ -351,142 +351,6 @@ async def upload_audio(
 
 
 # ============================================================
-# POST /api/transcribe
-# ============================================================
-
-@app.post("/api/transcribe")
-async def transcribe_audio(
-    file: UploadFile = File(...),
-):
-    """
-    Speech-to-text.
-
-    Without OPENAI_API_KEY:
-        Returns structured demo response.
-
-    With OPENAI_API_KEY:
-        Attempts real transcription.
-    """
-
-    if not file.filename:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "success": False,
-                "error": "NO_FILENAME",
-                "message": "No filename was provided.",
-            },
-        )
-
-    extension = validate_extension(file.filename)
-
-    temporary_path = None
-
-    try:
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=extension,
-        ) as temp_file:
-            temporary_path = temp_file.name
-
-        file_size = await save_upload_with_limit(
-            file,
-            temporary_path,
-        )
-
-        if file_size <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "success": False,
-                    "error": "EMPTY_AUDIO_FILE",
-                    "message": "The uploaded audio file is empty.",
-                },
-            )
-
-        # ----------------------------------------------------
-        # DEMO MODE
-        # ----------------------------------------------------
-
-        if client is None:
-            return {
-                "success": True,
-                "mode": "demo",
-                "endpoint": "/api/transcribe",
-                "message": (
-                    "Transcription endpoint is working, "
-                    "but OPENAI_API_KEY is not configured."
-                ),
-                "text": (
-                    "[DEMO TRANSCRIPT] "
-                    "No OpenAI API key is configured, "
-                    "so real transcription is disabled."
-                ),
-                "filename": file.filename,
-                "size_bytes": file_size,
-                "openai_configured": False,
-            }
-
-        # ----------------------------------------------------
-        # REAL MODE
-        # ----------------------------------------------------
-
-        try:
-            with open(
-                temporary_path,
-                "rb",
-            ) as audio_file:
-
-                # OpenAI's current transcription models return a JSON
-                # transcription object. Explicitly request JSON so the SDK
-                # always gives us a response object containing `.text`.
-                result = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="json",
-                )
-
-            text = (
-                getattr(result, "text", None)
-                or ""
-            ).strip()
-
-            # Do not report success when OpenAI returned an empty transcript.
-            # This makes the real failure visible to the frontend instead of
-            # looking like a successful upload with missing text.
-            if not text:
-                raise RuntimeError(
-                    "OpenAI accepted the audio file but returned an empty "
-                    "transcription. Check that the uploaded file contains "
-                    "audible speech and is a supported audio format."
-                )
-
-            return {
-                "success": True,
-                "mode": "openai",
-                "endpoint": "/api/transcribe",
-                "text": text,
-                "filename": file.filename,
-                "size_bytes": file_size,
-                "openai_configured": True,
-            }
-
-        except Exception as exc:
-            return {
-                "success": False,
-                "mode": "openai",
-                "endpoint": "/api/transcribe",
-                "error": "TRANSCRIPTION_FAILED",
-                "message": str(exc),
-                "text": "",
-                "openai_configured": True,
-            }
-
-    finally:
-        safe_remove(temporary_path)
-
-
-# ============================================================
 # POST /api/translate
 # ============================================================
 
@@ -523,6 +387,67 @@ async def translate_text(
                 "message": "Text cannot be empty.",
             },
         )
+
+    if source_language != "auto" and source_language == target_language:
+        return {
+            "success": True,
+            "mode": "passthrough",
+            "translated_text": text,
+            "openai_configured": client is not None,
+        }
+
+    if client is None:
+        return {
+            "success": True,
+            "mode": "demo",
+            "translated_text": f"[DEMO TRANSLATION -> {target_language}] {text}",
+            "openai_configured": False,
+        }
+
+    try:
+        prompt = (
+            "Translate the following text accurately.\n\n"
+            f"Source language: {source_language}\n"
+            f"Target language: {target_language}\n\n"
+            "Return ONLY the translated text. Do not add explanations.\n\n"
+            f"Text:\n{text}"
+        )
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+        )
+
+        translated_text = (
+            getattr(
+                response.choices[0].message,
+                "content",
+                "",
+            )
+            or ""
+        ).strip()
+
+        return {
+            "success": True,
+            "mode": "openai",
+            "translated_text": translated_text,
+            "openai_configured": True,
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "mode": "openai",
+            "error": "TRANSLATION_FAILED",
+            "message": str(exc),
+            "translated_text": "",
+            "openai_configured": True,
+        }
 
     # --------------------------------------------------------
     # SAME LANGUAGE
