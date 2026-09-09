@@ -367,7 +367,7 @@ async def transcribe_audio(
     The uploaded audio is first saved to a temporary file,
     then uploaded to Gemini Files API and transcribed.
 
-    No Google Gemini API is used.
+    Google Gemini API is used for transcription.
     """
 
     if not file.filename:
@@ -437,15 +437,19 @@ async def transcribe_audio(
                 file=temporary_path,
             )
 
-            response = gemini_client.models.generate_content(
+            interaction = gemini_client.interactions.create(
                 model=GEMINI_TRANSCRIBE_MODEL,
-                contents=[
-                    gemini_file,
+                input=[
+                    {
+                        "type": "audio",
+                        "uri": gemini_file.uri,
+                        "mime_type": gemini_file.mime_type,
+                    }
                 ],
             )
 
             text = (
-                getattr(response, "text", "")
+                getattr(interaction, "output_text", "")
                 or ""
             ).strip()
 
