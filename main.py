@@ -1,5 +1,7 @@
 import os
+import base64
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -82,6 +84,14 @@ if GEMINI_API_KEY:
 # Gemini model used for speech transcription.
 # This is the dedicated Gemini transcription model.
 GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
+
+# Small audio files can be sent inline. This avoids the Gemini Files API
+# processing-state race (PROCESSING -> ACTIVE) for short browser recordings.
+# Keep this below the documented 20 MB inline-audio request limit because
+# base64 encoding increases the request size.
+INLINE_AUDIO_MAX_BYTES = 15 * 1024 * 1024
+GEMINI_FILE_ACTIVE_TIMEOUT_SECONDS = 60
+GEMINI_FILE_POLL_SECONDS = 2
 
 # ============================================================
 # FASTAPI APPLICATION
@@ -389,7 +399,16 @@ async def upload_audio(
 async def transcribe_audio(
     file: UploadFile = File(...),
 ):
-    """Speech-to-text using the Gemini Files API + Interactions API."""
+    """
+    Speech-to-text using Gemini 3.5 Transcribe.
+
+    Strategy:
+      1. Save and validate the upload locally.
+      2. For small audio (<= 15 MB), send it inline as base64.
+         This avoids the Gemini Files API processing-state race.
+      3. For larger audio, use Gemini Files API and explicitly wait until
+         the uploaded file reaches ACTIVE before calling the model.
+    """
 
     if not file.filename:
         raise HTTPException(
@@ -405,7 +424,6 @@ async def transcribe_audio(
     extension = validate_extension(file.filename)
     mime_type = get_safe_mime_type(file, extension)
     temporary_path = None
-    gemini_file = None
 
     try:
         with tempfile.NamedTemporaryFile(
@@ -417,9 +435,16 @@ async def transcribe_audio(
         try:
             file_size = await save_upload_with_limit(file, temporary_path)
         except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            detail = (
+                exc.detail
+                if isinstance(exc.detail, dict)
+                else {"message": str(exc.detail)}
+            )
             detail.setdefault("stage", "temporary_file_save")
-            raise HTTPException(status_code=exc.status_code, detail=detail) from exc
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=detail,
+            ) from exc
 
         if file_size <= 0:
             raise HTTPException(
@@ -449,13 +474,95 @@ async def transcribe_audio(
                 "gemini_configured": False,
             }
 
-        # Stage 1: upload the saved audio to Gemini Files API.
+        # --------------------------------------------------------
+        # PATH A: SMALL AUDIO -> INLINE BASE64
+        # --------------------------------------------------------
+        if file_size <= INLINE_AUDIO_MAX_BYTES:
+            try:
+                with open(temporary_path, "rb") as audio_file:
+                    audio_bytes = audio_file.read()
+
+                audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+                interaction = gemini_client.interactions.create(
+                    model=GEMINI_TRANSCRIBE_MODEL,
+                    input=[
+                        {
+                            "type": "text",
+                            "text": "Generate a transcript of the speech. Return only the spoken transcript text.",
+                        },
+                        {
+                            "type": "audio",
+                            "data": audio_b64,
+                            "mime_type": mime_type,
+                        },
+                    ],
+                )
+
+                text = (
+                    getattr(interaction, "output_text", "") or ""
+                ).strip()
+
+                if not text:
+                    return {
+                        "success": False,
+                        "mode": "gemini_inline",
+                        "endpoint": "/api/transcribe",
+                        "stage": "transcript_extraction",
+                        "error": "EMPTY_TRANSCRIPTION",
+                        "message": "Gemini completed the request but returned no transcript text. Check that the audio contains audible speech.",
+                        "text": "",
+                        "filename": file.filename,
+                        "extension": extension,
+                        "mime_type": mime_type,
+                        "size_bytes": file_size,
+                        "model": GEMINI_TRANSCRIBE_MODEL,
+                        "gemini_configured": True,
+                    }
+
+                return {
+                    "success": True,
+                    "mode": "gemini_inline",
+                    "endpoint": "/api/transcribe",
+                    "stage": "complete",
+                    "model": GEMINI_TRANSCRIBE_MODEL,
+                    "text": text,
+                    "filename": file.filename,
+                    "extension": extension,
+                    "mime_type": mime_type,
+                    "size_bytes": file_size,
+                    "size_mb": round(file_size / (1024 * 1024), 2),
+                    "transport": "inline_base64",
+                    "gemini_configured": True,
+                }
+
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "mode": "gemini_inline",
+                    "endpoint": "/api/transcribe",
+                    "stage": "gemini_interaction_inline",
+                    "error": "GEMINI_TRANSCRIPTION_REQUEST_FAILED",
+                    "message": safe_error_message(exc),
+                    "text": "",
+                    "filename": file.filename,
+                    "extension": extension,
+                    "mime_type": mime_type,
+                    "size_bytes": file_size,
+                    "model": GEMINI_TRANSCRIBE_MODEL,
+                    "transport": "inline_base64",
+                    "gemini_configured": True,
+                }
+
+        # --------------------------------------------------------
+        # PATH B: LARGE AUDIO -> FILES API + WAIT FOR ACTIVE
+        # --------------------------------------------------------
         try:
             gemini_file = gemini_client.files.upload(file=temporary_path)
         except Exception as exc:
             return {
                 "success": False,
-                "mode": "gemini",
+                "mode": "gemini_files",
                 "endpoint": "/api/transcribe",
                 "stage": "gemini_files_upload",
                 "error": "GEMINI_FILE_UPLOAD_FAILED",
@@ -468,39 +575,111 @@ async def transcribe_audio(
                 "gemini_configured": True,
             }
 
+        file_name = getattr(gemini_file, "name", None)
         gemini_uri = getattr(gemini_file, "uri", None)
         gemini_mime_type = getattr(gemini_file, "mime_type", None) or mime_type
 
-        if not gemini_uri:
+        if not file_name or not gemini_uri:
             return {
                 "success": False,
-                "mode": "gemini",
+                "mode": "gemini_files",
                 "endpoint": "/api/transcribe",
                 "stage": "gemini_files_upload",
-                "error": "GEMINI_FILE_URI_MISSING",
-                "message": "Gemini accepted the upload but did not return a file URI.",
+                "error": "GEMINI_FILE_METADATA_MISSING",
+                "message": "Gemini accepted the upload but did not return the required file name/URI.",
                 "text": "",
                 "filename": file.filename,
                 "mime_type": gemini_mime_type,
                 "gemini_configured": True,
             }
 
-        # Stage 2: send the uploaded file to the dedicated transcription model.
+        # Gemini Files can initially be PROCESSING. It must be ACTIVE before
+        # the file URI is used for inference. This is the exact failure seen
+        # in the user's diagnostic board.
+        deadline = time.monotonic() + GEMINI_FILE_ACTIVE_TIMEOUT_SECONDS
+        current_file = gemini_file
+        last_state = None
+
+        while True:
+            state = getattr(current_file, "state", None)
+            state_name = getattr(state, "name", None) or str(state or "")
+            last_state = state_name
+
+            if state_name.upper() == "ACTIVE":
+                break
+
+            if state_name.upper() == "FAILED":
+                file_error = getattr(current_file, "error", None)
+                return {
+                    "success": False,
+                    "mode": "gemini_files",
+                    "endpoint": "/api/transcribe",
+                    "stage": "gemini_file_processing",
+                    "error": "GEMINI_FILE_PROCESSING_FAILED",
+                    "message": str(file_error or "Gemini failed to process the uploaded file."),
+                    "text": "",
+                    "filename": file.filename,
+                    "mime_type": gemini_mime_type,
+                    "file_state": state_name,
+                    "gemini_configured": True,
+                }
+
+            if time.monotonic() >= deadline:
+                return {
+                    "success": False,
+                    "mode": "gemini_files",
+                    "endpoint": "/api/transcribe",
+                    "stage": "gemini_file_processing",
+                    "error": "GEMINI_FILE_NOT_ACTIVE_TIMEOUT",
+                    "message": f"Gemini file did not become ACTIVE within {GEMINI_FILE_ACTIVE_TIMEOUT_SECONDS} seconds.",
+                    "text": "",
+                    "filename": file.filename,
+                    "mime_type": gemini_mime_type,
+                    "file_state": last_state,
+                    "gemini_configured": True,
+                }
+
+            time.sleep(GEMINI_FILE_POLL_SECONDS)
+
+            try:
+                current_file = gemini_client.files.get(name=file_name)
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "mode": "gemini_files",
+                    "endpoint": "/api/transcribe",
+                    "stage": "gemini_file_status_check",
+                    "error": "GEMINI_FILE_STATUS_CHECK_FAILED",
+                    "message": safe_error_message(exc),
+                    "text": "",
+                    "filename": file.filename,
+                    "mime_type": gemini_mime_type,
+                    "file_state": last_state,
+                    "gemini_configured": True,
+                }
+
+        gemini_uri = getattr(current_file, "uri", None) or gemini_uri
+        gemini_mime_type = getattr(current_file, "mime_type", None) or gemini_mime_type
+
         try:
             interaction = gemini_client.interactions.create(
                 model=GEMINI_TRANSCRIBE_MODEL,
                 input=[
                     {
+                        "type": "text",
+                        "text": "Generate a transcript of the speech. Return only the spoken transcript text.",
+                    },
+                    {
                         "type": "audio",
                         "uri": gemini_uri,
                         "mime_type": gemini_mime_type,
-                    }
+                    },
                 ],
             )
         except Exception as exc:
             return {
                 "success": False,
-                "mode": "gemini",
+                "mode": "gemini_files",
                 "endpoint": "/api/transcribe",
                 "stage": "gemini_interaction",
                 "error": "GEMINI_TRANSCRIPTION_REQUEST_FAILED",
@@ -511,16 +690,17 @@ async def transcribe_audio(
                 "mime_type": gemini_mime_type,
                 "size_bytes": file_size,
                 "model": GEMINI_TRANSCRIBE_MODEL,
+                "file_state": "ACTIVE",
+                "transport": "files_api",
                 "gemini_configured": True,
             }
 
-        # Stage 3: extract the documented output_text field.
         text = (getattr(interaction, "output_text", "") or "").strip()
 
         if not text:
             return {
                 "success": False,
-                "mode": "gemini",
+                "mode": "gemini_files",
                 "endpoint": "/api/transcribe",
                 "stage": "transcript_extraction",
                 "error": "EMPTY_TRANSCRIPTION",
@@ -531,12 +711,14 @@ async def transcribe_audio(
                 "mime_type": gemini_mime_type,
                 "size_bytes": file_size,
                 "model": GEMINI_TRANSCRIBE_MODEL,
+                "file_state": "ACTIVE",
+                "transport": "files_api",
                 "gemini_configured": True,
             }
 
         return {
             "success": True,
-            "mode": "gemini",
+            "mode": "gemini_files",
             "endpoint": "/api/transcribe",
             "stage": "complete",
             "model": GEMINI_TRANSCRIBE_MODEL,
@@ -546,11 +728,14 @@ async def transcribe_audio(
             "mime_type": gemini_mime_type,
             "size_bytes": file_size,
             "size_mb": round(file_size / (1024 * 1024), 2),
+            "file_state": "ACTIVE",
+            "transport": "files_api",
             "gemini_configured": True,
         }
 
     finally:
         safe_remove(temporary_path)
+
 
 
 # ============================================================
