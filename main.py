@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from openai import OpenAI
+from google import genai
 
 
 # ============================================================
@@ -64,21 +64,24 @@ CODESPACES_ORIGIN_REGEX = (
 
 
 # ============================================================
-# OPENAI
+# GOOGLE GEMINI
 # ============================================================
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-client: Optional[OpenAI] = None
+gemini_client: Optional[genai.Client] = None
 
-if OPENAI_API_KEY:
+if GEMINI_API_KEY:
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception:
         # Never crash the backend just because the client
         # could not be initialized.
-        client = None
+        gemini_client = None
 
+# Gemini model used for speech transcription.
+# This is the dedicated Gemini transcription model.
+GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
 
 # ============================================================
 # FASTAPI APPLICATION
@@ -237,7 +240,7 @@ async def root():
         "name": APP_NAME,
         "status": "online",
         "version": APP_VERSION,
-        "openai_configured": client is not None,
+        "gemini_configured": gemini_client is not None,
         "max_upload_size_mb": 25,
         "routes": {
             "health": "GET /health",
@@ -260,7 +263,7 @@ async def health():
         "status": "healthy",
         "service": APP_NAME,
         "version": APP_VERSION,
-        "openai_configured": client is not None,
+        "gemini_configured": gemini_client is not None,
         "max_upload_size_mb": 25,
     }
 
@@ -276,7 +279,7 @@ async def api_info():
         "name": APP_NAME,
         "version": APP_VERSION,
         "status": "online",
-        "openai_configured": client is not None,
+        "gemini_configured": gemini_client is not None,
         "max_upload_size_mb": 25,
         "endpoints": [
             "GET /",
@@ -333,7 +336,7 @@ async def upload_audio(
 
         return {
             "success": True,
-            "mode": "demo" if client is None else "ready",
+            "mode": "ready" if gemini_client is not None else "demo",
             "message": "File uploaded and validated successfully.",
             "filename": file.filename,
             "extension": extension,
@@ -343,7 +346,7 @@ async def upload_audio(
                 2,
             ),
             "max_size_mb": 25,
-            "openai_configured": client is not None,
+            "gemini_configured": gemini_client is not None,
         }
 
     finally:
@@ -359,13 +362,12 @@ async def transcribe_audio(
     file: UploadFile = File(...),
 ):
     """
-    Speech-to-text using OpenAI Whisper.
+    Speech-to-text using Google Gemini.
 
-    Without OPENAI_API_KEY:
-        Returns structured demo response.
+    The uploaded audio is first saved to a temporary file,
+    then uploaded to Gemini Files API and transcribed.
 
-    With OPENAI_API_KEY:
-        Attempts real transcription using whisper-1.
+    No Google Gemini API is used.
     """
 
     if not file.filename:
@@ -381,6 +383,7 @@ async def transcribe_audio(
     extension = validate_extension(file.filename)
 
     temporary_path = None
+    gemini_file = None
 
     try:
         with tempfile.NamedTemporaryFile(
@@ -404,24 +407,17 @@ async def transcribe_audio(
                 },
             )
 
-        # ----------------------------------------------------
-        # DEMO MODE
-        # ----------------------------------------------------
-
-        if client is None:
+        if gemini_client is None:
             return {
-                "success": True,
+                "success": False,
                 "mode": "demo",
                 "endpoint": "/api/transcribe",
+                "error": "GEMINI_NOT_CONFIGURED",
                 "message": (
-                    "Transcription endpoint is working, "
-                    "but OPENAI_API_KEY is not configured."
+                    "GEMINI_API_KEY is not configured. "
+                    "Add GEMINI_API_KEY to the backend environment."
                 ),
-                "text": (
-                    "[DEMO TRANSCRIPT] "
-                    "No OpenAI API key is configured, "
-                    "so real transcription is disabled."
-                ),
+                "text": "",
                 "filename": file.filename,
                 "extension": extension,
                 "size_bytes": file_size,
@@ -429,49 +425,42 @@ async def transcribe_audio(
                     file_size / (1024 * 1024),
                     2,
                 ),
-                "openai_configured": False,
+                "gemini_configured": False,
             }
 
-        # ----------------------------------------------------
-        # REAL WHISPER MODE
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # GEMINI TRANSCRIPTION
+        # --------------------------------------------------------
 
         try:
-            with open(
-                temporary_path,
-                "rb",
-            ) as audio_file:
+            gemini_file = gemini_client.files.upload(
+                file=temporary_path,
+            )
 
-                result = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=(
-                        file.filename,
-                        audio_file,
-                        f"audio/{extension.lstrip('.')}",
-                    ),
-                    response_format="json",
-                )
+            response = gemini_client.models.generate_content(
+                model=GEMINI_TRANSCRIBE_MODEL,
+                contents=[
+                    gemini_file,
+                ],
+            )
 
             text = (
-                getattr(
-                    result,
-                    "text",
-                    None,
-                )
+                getattr(response, "text", "")
                 or ""
             ).strip()
 
             if not text:
                 raise RuntimeError(
-                    "OpenAI accepted the audio file but returned "
+                    "Gemini accepted the audio file but returned "
                     "an empty transcription. Check that the uploaded "
                     "file contains audible speech."
                 )
 
             return {
                 "success": True,
-                "mode": "openai",
+                "mode": "gemini",
                 "endpoint": "/api/transcribe",
+                "model": GEMINI_TRANSCRIBE_MODEL,
                 "text": text,
                 "filename": file.filename,
                 "extension": extension,
@@ -480,24 +469,24 @@ async def transcribe_audio(
                     file_size / (1024 * 1024),
                     2,
                 ),
-                "openai_configured": True,
+                "gemini_configured": True,
             }
 
         except Exception as exc:
             return {
                 "success": False,
-                "mode": "openai",
+                "mode": "gemini",
                 "endpoint": "/api/transcribe",
                 "error": "TRANSCRIPTION_FAILED",
                 "message": str(exc),
                 "text": "",
                 "filename": file.filename,
-                "openai_configured": True,
+                "extension": extension,
+                "gemini_configured": True,
             }
 
     finally:
         safe_remove(temporary_path)
-
 
 # ============================================================
 # POST /api/translate
@@ -508,13 +497,9 @@ async def translate_text(
     request: TranslateRequest,
 ):
     """
-    Text translation.
+    Text translation using Google Gemini.
 
-    Without OPENAI_API_KEY:
-        Returns structured demo translation.
-
-    With OPENAI_API_KEY:
-        Attempts real translation.
+    No Google Gemini API is used.
     """
 
     text = request.text.strip()
@@ -549,26 +534,24 @@ async def translate_text(
             "target_language": target_language,
             "original_text": text,
             "translated_text": text,
-            "openai_configured": client is not None,
+            "gemini_configured": gemini_client is not None,
         }
 
-    if client is None:
+    if gemini_client is None:
         return {
-            "success": True,
+            "success": False,
             "mode": "demo",
             "endpoint": "/api/translate",
+            "error": "GEMINI_NOT_CONFIGURED",
             "message": (
-                "Translation endpoint is working, "
-                "but OPENAI_API_KEY is not configured."
+                "GEMINI_API_KEY is not configured. "
+                "Add GEMINI_API_KEY to the backend environment."
             ),
             "source_language": source_language,
             "target_language": target_language,
             "original_text": text,
-            "translated_text": (
-                f"[DEMO TRANSLATION -> "
-                f"{target_language}] {text}"
-            ),
-            "openai_configured": False,
+            "translated_text": "",
+            "gemini_configured": False,
         }
 
     try:
@@ -581,57 +564,45 @@ async def translate_text(
             f"Text:\n{text}"
         )
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
+        response = gemini_client.models.generate_content(
+            model="gemini-3.7-flash",
+            contents=prompt,
         )
 
         translated_text = (
-            getattr(
-                response.choices[0].message,
-                "content",
-                "",
-            )
+            getattr(response, "text", "")
             or ""
         ).strip()
 
         if not translated_text:
             return {
                 "success": False,
-                "mode": "openai",
+                "mode": "gemini",
                 "endpoint": "/api/translate",
                 "error": "EMPTY_TRANSLATION",
-                "message": (
-                    "The translation service returned "
-                    "an empty result."
-                ),
+                "message": "Gemini returned an empty translation.",
                 "source_language": source_language,
                 "target_language": target_language,
                 "original_text": text,
                 "translated_text": "",
-                "openai_configured": True,
+                "gemini_configured": True,
             }
 
         return {
             "success": True,
-            "mode": "openai",
+            "mode": "gemini",
             "endpoint": "/api/translate",
             "source_language": source_language,
             "target_language": target_language,
             "original_text": text,
             "translated_text": translated_text,
-            "openai_configured": True,
+            "gemini_configured": True,
         }
 
     except Exception as exc:
         return {
             "success": False,
-            "mode": "openai",
+            "mode": "gemini",
             "endpoint": "/api/translate",
             "error": "TRANSLATION_FAILED",
             "message": str(exc),
@@ -639,119 +610,7 @@ async def translate_text(
             "target_language": target_language,
             "original_text": text,
             "translated_text": "",
-            "openai_configured": True,
-        }
-
-    # --------------------------------------------------------
-    # SAME LANGUAGE
-    # --------------------------------------------------------
-
-    if (
-        source_language != "auto"
-        and source_language == target_language
-    ):
-        return {
-            "success": True,
-            "mode": "passthrough",
-            "endpoint": "/api/translate",
-            "source_language": source_language,
-            "target_language": target_language,
-            "original_text": text,
-            "translated_text": text,
-            "openai_configured": client is not None,
-        }
-
-    # --------------------------------------------------------
-    # DEMO MODE
-    # --------------------------------------------------------
-
-    if client is None:
-        return {
-            "success": True,
-            "mode": "demo",
-            "endpoint": "/api/translate",
-            "message": (
-                "Translation endpoint is working, "
-                "but OPENAI_API_KEY is not configured."
-            ),
-            "source_language": source_language,
-            "target_language": target_language,
-            "original_text": text,
-            "translated_text": (
-                f"[DEMO TRANSLATION -> "
-                f"{target_language}] {text}"
-            ),
-            "openai_configured": False,
-        }
-
-    # --------------------------------------------------------
-    # REAL MODE
-    # --------------------------------------------------------
-
-    try:
-        prompt = (
-            "Translate the following text accurately.\n\n"
-            f"Source language: {source_language}\n"
-            f"Target language: {target_language}\n\n"
-            "Return ONLY the translated text. "
-            "Do not add explanations.\n\n"
-            f"Text:\n{text}"
-        )
-
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=prompt,
-        )
-
-        translated_text = (
-            getattr(
-                response,
-                "output_text",
-                "",
-            )
-            or ""
-        ).strip()
-
-        if not translated_text:
-            return {
-                "success": False,
-                "mode": "openai",
-                "endpoint": "/api/translate",
-                "error": "EMPTY_TRANSLATION",
-                "message": (
-                    "The translation service returned "
-                    "an empty result."
-                ),
-                "source_language": source_language,
-                "target_language": target_language,
-                "original_text": text,
-                "translated_text": "",
-                "openai_configured": True,
-            }
-
-        return {
-            "success": True,
-            "mode": "openai",
-            "endpoint": "/api/translate",
-            "source_language": source_language,
-            "target_language": target_language,
-            "original_text": text,
-            "translated_text": translated_text,
-            "openai_configured": True,
-        }
-
-    except Exception as exc:
-        return {
-            "success": False,
-            "mode": "openai",
-            "endpoint": "/api/translate",
-            "error": "TRANSLATION_FAILED",
-            "message": str(exc),
-            "source_language": source_language,
-            "target_language": target_language,
-            "original_text": text,
-            "translated_text": "",
-            "openai_configured": True,
+            "gemini_configured": True,
         }
 
 
@@ -767,19 +626,14 @@ async def generate_dubbing(
     voice_reference: Optional[UploadFile] = File(None),
 ):
     """
-    Text-to-speech / dubbing endpoint.
+    Dubbing endpoint placeholder.
 
-    IMPORTANT:
-    This implementation does NOT clone a user's voice.
+    Google Gemini TTS/voice-cloning calls have been removed.
+    Gemini transcription and translation are supported by this backend.
 
-    voice_reference is accepted and validated as an optional
-    reference file, but it is not used for voice cloning.
-
-    Without OPENAI_API_KEY:
-        Returns structured demo response.
-
-    With OPENAI_API_KEY:
-        Generates standard TTS audio.
+    This endpoint currently validates the request but does not generate
+    an audio file. A Gemini TTS implementation can be added separately
+    if audio synthesis is required.
     """
 
     text = text.strip()
@@ -804,33 +658,22 @@ async def generate_dubbing(
             },
         )
 
-    # --------------------------------------------------------
-    # OPTIONAL VOICE REFERENCE
-    # --------------------------------------------------------
-
     reference_path = None
     reference_size = 0
     reference_filename = None
 
     if voice_reference is not None:
-
         if not voice_reference.filename:
             raise HTTPException(
                 status_code=400,
                 detail={
                     "success": False,
                     "error": "INVALID_VOICE_REFERENCE",
-                    "message": (
-                        "Voice reference filename "
-                        "is missing."
-                    ),
+                    "message": "Voice reference filename is missing.",
                 },
             )
 
-        reference_filename = (
-            voice_reference.filename
-        )
-
+        reference_filename = voice_reference.filename
         reference_extension = validate_extension(
             voice_reference.filename
         )
@@ -842,108 +685,38 @@ async def generate_dubbing(
             ) as temp_file:
                 reference_path = temp_file.name
 
-            reference_size = (
-                await save_upload_with_limit(
-                    voice_reference,
-                    reference_path,
-                )
+            reference_size = await save_upload_with_limit(
+                voice_reference,
+                reference_path,
             )
 
         except Exception:
             safe_remove(reference_path)
             raise
 
-    # --------------------------------------------------------
-    # DEMO MODE
-    # --------------------------------------------------------
+    safe_remove(reference_path)
 
-    if client is None:
-
-        safe_remove(reference_path)
-
-        return {
-            "success": True,
-            "mode": "demo",
-            "endpoint": "/api/dubbing",
-            "message": (
-                "Dubbing endpoint is working, "
-                "but OPENAI_API_KEY is not configured. "
-                "No audio file was generated."
-            ),
-            "target_language": target_language,
-            "voice": voice,
-            "text": text,
-            "audio_generated": False,
-            "audio_url": None,
-            "voice_cloning": False,
-            "voice_reference_received": (
-                reference_filename is not None
-            ),
-            "voice_reference_filename": (
-                reference_filename
-            ),
-            "voice_reference_size_bytes": (
-                reference_size
-            ),
-            "openai_configured": False,
-        }
-
-    # --------------------------------------------------------
-    # REAL TTS MODE
-    # --------------------------------------------------------
-
-    output_path = None
-
-    try:
-
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".mp3",
-        ) as output_file:
-            output_path = output_file.name
-
-        try:
-
-            response = client.audio.speech.create(
-                model="gpt-4o-mini-tts",
-                voice=voice,
-                input=text,
-                response_format="mp3",
-            )
-
-            response.write_to_file(
-                output_path
-            )
-
-            # Do NOT delete output_path here.
-            # FileResponse needs the file to still exist.
-            return FileResponse(
-                path=output_path,
-                media_type="audio/mpeg",
-                filename="bicon_dubbed_audio.mp3",
-            )
-
-        except Exception as exc:
-
-            safe_remove(output_path)
-
-            return {
-                "success": False,
-                "mode": "openai",
-                "endpoint": "/api/dubbing",
-                "error": "DUBBING_FAILED",
-                "message": str(exc),
-                "target_language": target_language,
-                "voice": voice,
-                "text": text,
-                "audio_generated": False,
-                "audio_url": None,
-                "voice_cloning": False,
-                "openai_configured": True,
-            }
-
-    finally:
-        safe_remove(reference_path)
+    return {
+        "success": False,
+        "mode": "not_implemented",
+        "endpoint": "/api/dubbing",
+        "error": "TTS_NOT_CONFIGURED",
+        "message": (
+            "Google Gemini TTS has been removed. "
+            "This backend currently uses Gemini for transcription "
+            "and translation only."
+        ),
+        "target_language": target_language,
+        "voice": voice,
+        "text": text,
+        "audio_generated": False,
+        "audio_url": None,
+        "voice_cloning": False,
+        "voice_reference_received": reference_filename is not None,
+        "voice_reference_filename": reference_filename,
+        "voice_reference_size_bytes": reference_size,
+        "gemini_configured": gemini_client is not None,
+    }
 
 
 # ============================================================
