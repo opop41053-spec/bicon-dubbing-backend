@@ -2,6 +2,8 @@ import os
 import base64
 import tempfile
 import time
+import wave
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -84,6 +86,12 @@ if GEMINI_API_KEY:
 # Gemini model used for speech transcription.
 # This is the dedicated Gemini transcription model.
 GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
+
+# Gemini text-to-speech configuration.
+GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
+GEMINI_DEFAULT_TTS_VOICE = "Kore"
+OUTPUT_DIR = Path(tempfile.gettempdir()) / "bicon_dubbing_outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Small audio files can be sent inline. This avoids the Gemini Files API
 # processing-state race (PROCESSING -> ACTIVE) for short browser recordings.
@@ -877,38 +885,43 @@ async def generate_dubbing(
     voice: str = Form("alloy"),
     voice_reference: Optional[UploadFile] = File(None),
 ):
-    """
-    Dubbing endpoint placeholder.
+    """Generate translated speech with Gemini TTS.
 
-    Google Gemini TTS/voice-cloning calls have been removed.
-    Gemini transcription and translation are supported by this backend.
-
-    This endpoint currently validates the request but does not generate
-    an audio file. A Gemini TTS implementation can be added separately
-    if audio synthesis is required.
+    Gemini TTS uses Google's built-in voices. The optional voice reference
+    is accepted and validated for future authorized voice-generation
+    integration, but it is NOT used to clone a person's voice here.
     """
 
     text = text.strip()
-
-    target_language = normalize_language(
-        target_language
-    )
-
-    voice = (
-        voice.strip()
-        if voice
-        else "alloy"
-    )
+    target_language = normalize_language(target_language)
+    voice = voice.strip() if voice else GEMINI_DEFAULT_TTS_VOICE
 
     if not text:
         raise HTTPException(
             status_code=400,
             detail={
                 "success": False,
+                "stage": "request_validation",
                 "error": "EMPTY_TEXT",
                 "message": "Dubbing text cannot be empty.",
             },
         )
+
+    if gemini_client is None:
+        return {
+            "success": False,
+            "mode": "demo",
+            "endpoint": "/api/dubbing",
+            "stage": "gemini_configuration",
+            "error": "GEMINI_NOT_CONFIGURED",
+            "message": "GEMINI_API_KEY is not configured on the backend.",
+            "target_language": target_language,
+            "voice": voice,
+            "audio_generated": False,
+            "audio_url": None,
+            "voice_cloning": False,
+            "voice_reference_received": voice_reference is not None,
+        }
 
     reference_path = None
     reference_size = 0
@@ -920,15 +933,14 @@ async def generate_dubbing(
                 status_code=400,
                 detail={
                     "success": False,
+                    "stage": "voice_reference_validation",
                     "error": "INVALID_VOICE_REFERENCE",
                     "message": "Voice reference filename is missing.",
                 },
             )
 
         reference_filename = voice_reference.filename
-        reference_extension = validate_extension(
-            voice_reference.filename
-        )
+        reference_extension = validate_extension(voice_reference.filename)
 
         try:
             with tempfile.NamedTemporaryFile(
@@ -941,35 +953,134 @@ async def generate_dubbing(
                 voice_reference,
                 reference_path,
             )
-
-        except Exception:
+        finally:
             safe_remove(reference_path)
-            raise
 
-    safe_remove(reference_path)
-
-    return {
-        "success": False,
-        "mode": "not_implemented",
-        "endpoint": "/api/dubbing",
-        "stage": "tts_not_configured",
-        "error": "TTS_NOT_CONFIGURED",
-        "message": (
-            "Google Gemini TTS has been removed. "
-            "This backend currently uses Gemini for transcription "
-            "and translation only."
-        ),
-        "target_language": target_language,
-        "voice": voice,
-        "text": text,
-        "audio_generated": False,
-        "audio_url": None,
-        "voice_cloning": False,
-        "voice_reference_received": reference_filename is not None,
-        "voice_reference_filename": reference_filename,
-        "voice_reference_size_bytes": reference_size,
-        "gemini_configured": gemini_client is not None,
+    # The frontend historically sends "alloy". Map it to a valid Gemini voice.
+    valid_voices = {
+        "zephyr", "puck", "charon", "kore", "fenrir",
+        "leda", "orus", "aoede", "callirrhoe", "autonoe",
+        "enceladus", "iapetus", "umbriel", "alnilam", "schedar",
+        "achird", "sadachbia", "vindemiatrix", "sadaltager", "sulafat",
+        "gacrux", "pulcherrima", "achernar", "zubenelgenubi",
+        "algieba", "despina", "erinome", "laomedeia", "rasalgethi",
+        "algenib",
     }
+    tts_voice = "Kore" if voice.lower() == "alloy" else voice
+    if tts_voice.lower() not in valid_voices:
+        tts_voice = GEMINI_DEFAULT_TTS_VOICE
+
+    prompt = (
+        f"Speak naturally in {target_language}. "
+        f"Return only the spoken content, with clear pronunciation.\n\n"
+        f"{text}"
+    )
+
+    try:
+        interaction = gemini_client.interactions.create(
+            model=GEMINI_TTS_MODEL,
+            input=prompt,
+            response_format={"type": "audio"},
+            generation_config={
+                "speech_config": [
+                    {"voice": tts_voice}
+                ]
+            },
+        )
+
+        output_audio = getattr(interaction, "output_audio", None)
+        audio_data = getattr(output_audio, "data", None)
+
+        if not audio_data:
+            raise RuntimeError(
+                "Gemini TTS completed without returning audio data."
+            )
+
+        pcm_bytes = base64.b64decode(audio_data)
+
+        filename = f"bicon_dub_{uuid.uuid4().hex}.wav"
+        output_path = OUTPUT_DIR / filename
+
+        with wave.open(str(output_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(24000)
+            wav_file.writeframes(pcm_bytes)
+
+        return {
+            "success": True,
+            "mode": "gemini_tts",
+            "endpoint": "/api/dubbing",
+            "stage": "complete",
+            "model": GEMINI_TTS_MODEL,
+            "target_language": target_language,
+            "voice": tts_voice,
+            "requested_voice": voice,
+            "text": text,
+            "audio_generated": True,
+            "audio_url": f"/api/audio/{filename}",
+            "voice_cloning": False,
+            "voice_reference_received": reference_filename is not None,
+            "voice_reference_filename": reference_filename,
+            "voice_reference_size_bytes": reference_size,
+            "gemini_configured": True,
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "mode": "gemini_tts",
+            "endpoint": "/api/dubbing",
+            "stage": "gemini_tts_request",
+            "error": "GEMINI_TTS_REQUEST_FAILED",
+            "message": safe_error_message(exc),
+            "target_language": target_language,
+            "voice": tts_voice,
+            "text": text,
+            "audio_generated": False,
+            "audio_url": None,
+            "voice_cloning": False,
+            "voice_reference_received": reference_filename is not None,
+            "gemini_configured": True,
+        }
+
+
+@app.get("/api/audio/{filename}")
+async def get_generated_audio(filename: str):
+    """Serve a generated BICON WAV file."""
+
+    if (
+        Path(filename).name != filename
+        or not filename.lower().endswith(".wav")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "success": False,
+                "stage": "audio_validation",
+                "error": "INVALID_AUDIO_FILENAME",
+                "message": "Invalid generated audio filename.",
+            },
+        )
+
+    audio_path = OUTPUT_DIR / filename
+
+    if not audio_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "success": False,
+                "stage": "audio_lookup",
+                "error": "AUDIO_NOT_FOUND",
+                "message": "Generated audio file was not found.",
+            },
+        )
+
+    return FileResponse(
+        path=str(audio_path),
+        media_type="audio/wav",
+        filename=filename,
+    )
 
 
 # ============================================================
