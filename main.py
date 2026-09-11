@@ -1,4 +1,5 @@
 import os
+import asyncio
 import base64
 import tempfile
 import time
@@ -20,7 +21,7 @@ from google import genai
 # ============================================================
 
 APP_NAME = "BICON DUBBING STUDIO API"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 # ============================================================
 # CONFIGURATION
@@ -90,6 +91,14 @@ GEMINI_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
 # Gemini text-to-speech configuration.
 GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
 GEMINI_DEFAULT_TTS_VOICE = "Kore"
+
+# Gemini translation configuration.
+# Temporary 503/high-demand failures are retried automatically.
+GEMINI_TRANSLATION_PRIMARY_MODEL = "gemini-3.7-flash"
+GEMINI_TRANSLATION_FALLBACK_MODEL = "gemini-3.6-flash"
+GEMINI_TRANSLATION_RETRIES = 3
+GEMINI_TRANSLATION_BACKOFF_SECONDS = 1.5
+
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "bicon_dubbing_outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -262,6 +271,77 @@ def safe_error_message(exc: Exception) -> str:
     if not message:
         return exc.__class__.__name__
     return message[:1000]
+
+
+# ============================================================
+# GEMINI TRANSLATION RETRY HELPERS
+# ============================================================
+
+def is_temporary_gemini_unavailable(exc: Exception) -> bool:
+    """Return True for Gemini temporary 503/high-demand failures."""
+    message = safe_error_message(exc).lower()
+    return (
+        "503" in message
+        or "unavailable" in message
+        or "high demand" in message
+        or "temporarily unavailable" in message
+        or "service unavailable" in message
+    )
+
+
+async def generate_translation_with_retry(prompt: str):
+    """
+    Try the primary translation model with exponential backoff.
+    If temporary 503/high-demand errors continue, use a stable fallback.
+    """
+    models_to_try = [
+        GEMINI_TRANSLATION_PRIMARY_MODEL,
+        GEMINI_TRANSLATION_FALLBACK_MODEL,
+    ]
+
+    last_exception = None
+    attempts = 0
+
+    for model_index, model_name in enumerate(models_to_try):
+        max_attempts = (
+            GEMINI_TRANSLATION_RETRIES
+            if model_index == 0
+            else 1
+        )
+
+        for attempt_index in range(max_attempts):
+            attempts += 1
+
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                return response, model_name, attempts
+
+            except Exception as exc:
+                last_exception = exc
+
+                # Retry only transient availability/high-demand failures.
+                if not is_temporary_gemini_unavailable(exc):
+                    raise
+
+                if attempt_index < max_attempts - 1:
+                    delay = (
+                        GEMINI_TRANSLATION_BACKOFF_SECONDS
+                        * (2 ** attempt_index)
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Primary model exhausted: give the fallback model a chance.
+                if model_index == 0:
+                    await asyncio.sleep(1.0)
+
+    if last_exception is not None:
+        raise last_exception
+
+    raise RuntimeError("Gemini translation failed without an exception.")
 
 
 # ============================================================
@@ -757,7 +837,8 @@ async def translate_text(
     """
     Text translation using Google Gemini.
 
-    No Google Gemini API is used.
+    Temporary 503/high-demand failures are handled automatically
+    with retries, exponential backoff, and a fallback model.
     """
 
     text = request.text.strip()
@@ -822,9 +903,8 @@ async def translate_text(
             f"Text:\n{text}"
         )
 
-        response = gemini_client.models.generate_content(
-            model="gemini-3.7-flash",
-            contents=prompt,
+        response, translation_model, translation_attempts = (
+            await generate_translation_with_retry(prompt)
         )
 
         translated_text = (
@@ -855,6 +935,8 @@ async def translate_text(
             "target_language": target_language,
             "original_text": text,
             "translated_text": translated_text,
+            "model": translation_model,
+            "attempts": translation_attempts,
             "gemini_configured": True,
         }
 
@@ -865,11 +947,20 @@ async def translate_text(
             "endpoint": "/api/translate",
             "stage": "translation_request",
             "error": "TRANSLATION_FAILED",
-            "message": safe_error_message(exc),
             "source_language": source_language,
             "target_language": target_language,
             "original_text": text,
             "translated_text": "",
+            "retryable": is_temporary_gemini_unavailable(exc),
+            "message": (
+                safe_error_message(exc)
+                + (
+                    " Gemini was temporarily unavailable even after "
+                    "automatic retries and fallback model."
+                    if is_temporary_gemini_unavailable(exc)
+                    else ""
+                )
+            ),
             "gemini_configured": True,
         }
 
